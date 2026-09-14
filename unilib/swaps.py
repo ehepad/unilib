@@ -473,11 +473,12 @@ class Swapper:
 
         try:
             if pool.pool_type == "v4":
-                # No unwrap step: in V4 the native coin is a currency in its own right,
-                # so the proceeds arrive native already.
+                # Usually no unwrap step: in V4 the native coin is a currency in
+                # its own right, so the proceeds arrive native already. The exception
+                # is a pool holding the wrapped form, which _v4_swap_tx unwraps.
                 tx = self._v4_swap_tx(
                     pool, pool.token, amount_in_wei, min_out_wei, deadline,
-                    native_value=False,
+                    native_value=False, unwrap=unwrap,
                 )
             elif pool.pool_type == "v3":
                 # When unwrapping, proceeds must land on the router first so it has
@@ -736,7 +737,7 @@ class Swapper:
     # -- plumbing -----------------------------------------------------------
 
     def _v4_swap_tx(self, pool, token_in, amount_in_wei, min_out_wei, deadline,
-                    native_value=False):
+                    native_value=False, unwrap=False):
         """
         Build a V4 swap as a Universal Router transaction.
 
@@ -747,32 +748,68 @@ class Swapper:
         native_value=True sends the input as msg.value - the buy case, where the input
         is the chain's native coin and there is nothing to approve. Selling instead
         needs the router to already hold permission through Permit2.
+
+        Not every V4 pool prices in the native coin, though. A few hold the wrapped
+        form instead, and there the input is an ERC20 like any other: settling it
+        against the user pulls it through Permit2, which reverts with
+        AllowanceExpired unless the wallet both holds wrapped coin and has granted
+        that allowance - while msg.value would be sent on top and left behind.
+        Wrapping inside the call removes both problems. WRAP_ETH turns the msg.value
+        into wrapped coin held by the router, and settling CONTRACT_BALANCE spends
+        that rather than anything of the user's, so no approval exists to expire.
+        The swap then takes OPEN_DELTA: the settled amount is only known while the
+        call runs, and naming a fixed figure leaves an unresolved balance that V4
+        rejects outright.
+
+        Selling into such a pool is the mirror image - the proceeds arrive wrapped,
+        so they are taken to the router and unwrapped before they reach the wallet.
         """
+        from uniswap_universal_router_decoder import FunctionRecipient, V4Constants
+
         ur_address = self._require_universal_router()
         codec = self._codec()
+        wrapped = Web3.to_checksum_address(self.chain.wrapped_native)
 
         token_out = pool.token1 if token_in.lower() == pool.token0.lower() else pool.token0
         zero_for_one = token_in.lower() == pool.token0.lower()
+        pays_wrapped = native_value and token_in.lower() == wrapped.lower()
+        takes_wrapped = unwrap and token_out.lower() == wrapped.lower()
 
-        return (
-            codec.encode.chain()
-            .v4_swap()
-            .swap_exact_in_single(
-                pool_key=self._v4_pool_key(pool),
-                zero_for_one=zero_for_one,
-                amount_in=amount_in_wei,
-                amount_out_min=min_out_wei,
-            )
-            .settle_all(Web3.to_checksum_address(token_in), amount_in_wei)
-            .take_all(Web3.to_checksum_address(token_out), min_out_wei)
-            .build_v4_swap()
-            .build_transaction(
-                self.address,
-                amount_in_wei if native_value else 0,
-                ur_address=ur_address,
-                deadline=deadline,
-                chain_id=self.chain.chain_id,
-            )
+        chain = codec.encode.chain()
+        if pays_wrapped:
+            chain = chain.wrap_eth(FunctionRecipient.ROUTER, amount_in_wei)
+
+        v4 = chain.v4_swap()
+        if pays_wrapped:
+            v4 = v4.settle(wrapped, V4Constants.CONTRACT_BALANCE.value, False)
+        v4 = v4.swap_exact_in_single(
+            pool_key=self._v4_pool_key(pool),
+            zero_for_one=zero_for_one,
+            amount_in=V4Constants.OPEN_DELTA.value if pays_wrapped else amount_in_wei,
+            amount_out_min=min_out_wei,
+        )
+        if not pays_wrapped:
+            v4 = v4.settle_all(Web3.to_checksum_address(token_in), amount_in_wei)
+        if takes_wrapped:
+            # Held by the router for one more command rather than going to the wallet
+            # wrapped. ADDRESS_THIS is the router's own address inside a command list.
+            v4 = v4.take(wrapped,
+                         Web3.to_checksum_address(
+                             "0x0000000000000000000000000000000000000002"),
+                         V4Constants.OPEN_DELTA.value)
+        else:
+            v4 = v4.take_all(Web3.to_checksum_address(token_out), min_out_wei)
+
+        chain = v4.build_v4_swap()
+        if takes_wrapped:
+            chain = chain.unwrap_weth(FunctionRecipient.SENDER, min_out_wei)
+
+        return chain.build_transaction(
+            self.address,
+            amount_in_wei if native_value else 0,
+            ur_address=ur_address,
+            deadline=deadline,
+            chain_id=self.chain.chain_id,
         )
 
     def _v3_tx(self, router, swap_fn, deadline, extra=None, value=0):
