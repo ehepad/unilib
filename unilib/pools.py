@@ -124,6 +124,94 @@ def pool_key_from_logs(w3, state_view_address, pool_id, from_block=0):
     return currency0, currency1, fee, tick_spacing, hooks
 
 
+# Uniswap's own tiers plus the ones launchpads use here. Only ever tried against a
+# hash that has to match exactly, so a wrong pair is rejected rather than accepted.
+_FEE_CANDIDATES = (0, 100, 200, 400, 500, 800, 1000, 2500, 3000, 4000, 5000,
+                   10000, 15000, 20000, 25000, 30000, 8388608)
+_TICK_CANDIDATES = (1, 2, 4, 5, 10, 20, 30, 50, 60, 100, 120, 200, 500, 1000, 60000)
+_V4_SWAP_TOPIC = "0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f"
+_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+
+def pool_key_from_swaps(w3, chain, pool_id, windows=(2000, 10000, 50000)):
+    """
+    Rebuild a PoolKey from a recent swap, on a chain whose history cannot be read.
+
+    The usual routes both need something this kind of endpoint will not give: the
+    PositionManager knows only pools liquidity has passed through, and the Initialize
+    event sits far enough back that a pruning node answers "pruned history
+    unavailable". What such a node will still serve is the recent past.
+
+    So the key is reconstructed rather than looked up. One recent swap on this pool
+    names the transaction; the transaction's Transfer logs name the currencies, and
+    its remaining log addresses are the only plausible hooks. Fee and tick spacing
+    come from a short list of the values anyone actually deploys.
+
+    The reconstruction proves itself. A pool id is keccak of the encoded PoolKey, so
+    a candidate that hashes to the id IS the key - there is no near-miss and nothing
+    to trust. That is the whole reason this is allowed to guess at all: every guess
+    is checked against the hash, and a wrong one simply never matches.
+
+    Returns (currency0, currency1, fee, tick_spacing, hooks), or raises.
+    """
+    state_view = w3.eth.contract(
+        address=Web3.to_checksum_address(chain.state_view), abi=abis.STATE_VIEW_ABI)
+    manager = state_view.functions.poolManager().call()
+
+    logs = []
+    latest = w3.eth.block_number
+    for window in windows:
+        try:
+            logs = w3.eth.get_logs({
+                "address": Web3.to_checksum_address(manager),
+                "topics": [_V4_SWAP_TOPIC, pool_id],
+                "fromBlock": max(0, latest - window),
+                "toBlock": "latest",
+            })
+        except Exception:
+            continue                    # range refused - try a narrower one
+        if logs:
+            break
+    if not logs:
+        raise ValueError(
+            f"{pool_id} icin yakin gecmiste swap yok - PoolKey kurulamiyor. "
+            "Havuz islem gormeye baslayinca tekrar deneyin")
+
+    receipt = w3.eth.get_transaction_receipt(logs[-1]["transactionHash"])
+    currencies, hooks = [], [NATIVE_ADDRESS]
+    for log in receipt["logs"]:
+        address = log["address"].lower()
+        topic = log["topics"][0].hex().lower() if log["topics"] else ""
+        if not topic.startswith("0x"):
+            topic = "0x" + topic
+        if topic == _TRANSFER_TOPIC:
+            if address not in currencies:
+                currencies.append(address)
+        elif address not in hooks and address.lower() != manager.lower():
+            hooks.append(address)
+    currencies.append(NATIVE_ADDRESS)
+
+    pairs = [(a, b) for i, a in enumerate(currencies) for b in currencies[i + 1:]]
+    target = pool_id.lower()
+    for hook in hooks:
+        for first, second in pairs:
+            c0, c1 = sorted([first.lower(), second.lower()])
+            for fee in _FEE_CANDIDATES:
+                for spacing in _TICK_CANDIDATES:
+                    encoded = w3.codec.encode(
+                        ["address", "address", "uint24", "int24", "address"],
+                        [Web3.to_checksum_address(c0), Web3.to_checksum_address(c1),
+                         fee, spacing, Web3.to_checksum_address(hook)])
+                    digest = Web3.keccak(encoded).hex().lower()
+                    if digest.removeprefix("0x") == target.removeprefix("0x"):
+                        return (Web3.to_checksum_address(c0),
+                                Web3.to_checksum_address(c1), fee, spacing,
+                                Web3.to_checksum_address(hook))
+    raise ValueError(
+        f"{pool_id} icin PoolKey kurulamadi - fee/tickSpacing/hook bu havuzda "
+        "alisildik degerlerin disinda olabilir")
+
+
 def fetch_v4_pool_key(w3, chain, pool_id, from_block=0):
     """
     The PoolKey behind a pool id, by whichever route this chain allows.
@@ -142,7 +230,13 @@ def fetch_v4_pool_key(w3, chain, pool_id, from_block=0):
         except Exception:
             pass                       # fall through to the slower way
 
-    return pool_key_from_logs(w3, chain.state_view, pool_id, from_block)
+    try:
+        return pool_key_from_logs(w3, chain.state_view, pool_id, from_block)
+    except Exception:
+        # Neither route was available. On a pruning endpoint that is not a dead end:
+        # the recent past still holds a swap, and a PoolKey can be rebuilt from it and
+        # checked against the id itself.
+        return pool_key_from_swaps(w3, chain, pool_id)
 
 
 class Pool:

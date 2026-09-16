@@ -358,12 +358,15 @@ class Swapper:
     # -- buying -------------------------------------------------------------
 
     def buy(self, pool, amount_in, slippage_pct=DEFAULT_SLIPPAGE_PCT, min_out=None,
-            fee_on_transfer=False, deadline_seconds=DEFAULT_DEADLINE_SECONDS):
+            fee_on_transfer=False, deadline_seconds=DEFAULT_DEADLINE_SECONDS,
+            approve=True, unlimited_approve=True):
         """
         Spend the chain's native coin to buy the pool's tracked token.
 
-        No approval is involved: native coin travels as msg.value and the router
-        wraps it, so there is no ERC20 for anyone to need permission over.
+        Usually no approval is involved: native coin travels as msg.value and the
+        router wraps it, so there is no ERC20 for anyone to need permission over.
+        Where the coin cannot be wrapped there is, and buying takes one first - see
+        pays_erc20 below.
 
         Set fee_on_transfer=True for tokens that take a cut on transfer ("vergili"
         tokens) - on V2 those revert through the plain function. It is harmless on
@@ -392,13 +395,17 @@ class Swapper:
         # routers pull it themselves, V4 goes through the Universal Router and so
         # through Permit2.
         pays_erc20 = not self.chain.wraps_native and token_in.lower() != NATIVE_ADDRESS
-        if pays_erc20:
+        # approve=False is for a caller that has arranged permission some other way -
+        # dryrun.py fakes it in storage, and an approval sent there would be the only
+        # transaction it ever captured, leaving the swap itself untested.
+        if pays_erc20 and approve:
             needed = int(amount_in * 10**pool.base_decimals)
             approval = (
                 self.ensure_permit2_allowance(
                     token_in, needed, self._require_universal_router())
                 if pool.pool_type == "v4"
-                else self.ensure_allowance(token_in, needed, router.address))
+                else self.ensure_allowance(token_in, needed, router.address,
+                                           unlimited=unlimited_approve))
             if not approval:
                 return approval
 
