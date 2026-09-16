@@ -853,6 +853,7 @@ class Swapper:
             ur_address=ur_address,
             deadline=deadline,
             chain_id=self.chain.chain_id,
+            max_fee_per_gas_limit=self._fee_ceiling(),
         )
 
     def _v3_tx(self, router, swap_fn, deadline, extra=None, value=0):
@@ -873,6 +874,27 @@ class Swapper:
         fn = router.functions.multicall(deadline, data)
 
         return fn.build_transaction(self._tx_params(value=value))
+
+    def _fee_ceiling(self):
+        """
+        How high the encoder may let its own computed fee go before refusing.
+
+        Not a fee and not a payment: what leaves the wallet is still the base fee at
+        inclusion. This only moves the guard the encoder applies to its own
+        arithmetic, whose default is a flat 100 gwei - a figure that assumes a chain
+        where the base fee sits near zero. It does not on all of them: Arc runs
+        around 20 gwei, the encoder's FAST setting multiplies that, and the swap was
+        refused before it was ever built.
+
+        Tied to the chain's own base fee rather than raised to a bigger constant, so
+        the guard still means something. Sixteen times covers the sharpest move
+        measured here - 8.49x inside twenty minutes - with room over it.
+        """
+        try:
+            base_fee = self.w3.eth.get_block("latest").get("baseFeePerGas") or 0
+        except Exception:
+            base_fee = 0
+        return max(100 * 10**9, base_fee * 16)
 
     def _tx_params(self, value=0):
         # chainId is stated rather than asked for. web3 would otherwise fetch it while
