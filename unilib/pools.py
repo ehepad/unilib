@@ -133,6 +133,95 @@ _V4_SWAP_TOPIC = "0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7
 _TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
 
+def _addresses_from_recent_swaps(w3, chain, pool_id, windows=(2000, 10000, 50000)):
+    """
+    Currencies and hook candidates from whatever swaps the node still remembers.
+
+    Returns (currencies, others). Both can come back short: V4 settles inside the
+    PoolManager, so a currency that never leaves it emits no Transfer, and a pool
+    whose trades are routed through several hops shows only the ends of the route.
+    """
+    state_view = w3.eth.contract(
+        address=Web3.to_checksum_address(chain.state_view), abi=abis.STATE_VIEW_ABI)
+    manager = state_view.functions.poolManager().call()
+
+    logs = []
+    latest = w3.eth.block_number
+    for window in windows:
+        try:
+            logs = w3.eth.get_logs({
+                "address": Web3.to_checksum_address(manager),
+                "topics": [_V4_SWAP_TOPIC, pool_id],
+                "fromBlock": max(0, latest - window),
+                "toBlock": "latest",
+            })
+        except Exception:
+            continue
+        if logs:
+            break
+    if not logs:
+        return [], []
+
+    currencies, others = [], []
+    # Several transactions rather than one: a pool traded through a route shows
+    # different ends each time, and the currencies turn up in whichever of them
+    # happened to swap this pool on its own.
+    for log in logs[-6:]:
+        receipt = w3.eth.get_transaction_receipt(log["transactionHash"])
+        for entry in receipt["logs"]:
+            address = entry["address"].lower()
+            topic = entry["topics"][0].hex().lower() if entry["topics"] else ""
+            topic = topic if topic.startswith("0x") else "0x" + topic
+            if topic == _TRANSFER_TOPIC:
+                if address not in currencies:
+                    currencies.append(address)
+            elif address != manager.lower() and address not in others:
+                others.append(address)
+    return currencies, others
+
+
+def find_pool_key(w3, chain, pool_id, currencies, hooks=()):
+    """
+    Search for a PoolKey with the currencies already known.
+
+    The automatic route fails on pools whose trades are routed: there is no Transfer
+    to read a currency off when V4 never moves it out of the manager. Told which two
+    they are - from a pool page, say - what is left is the fee, the tick spacing and
+    the hook, and that is small enough to walk through.
+
+    The pool id still decides. It is keccak of the encoded key, so a candidate that
+    hashes to it IS the key; a wrong one never matches and this returns None rather
+    than something plausible.
+
+    Hook candidates are whatever the caller passes plus the addresses seen alongside
+    recent swaps, and the zero address for a pool without one.
+    """
+    candidates = [NATIVE_ADDRESS] + [h.lower() for h in hooks if h]
+    try:
+        _, others = _addresses_from_recent_swaps(w3, chain, pool_id)
+    except Exception:
+        others = []
+    candidates += [a for a in others if a not in candidates]
+
+    currencies = [c.lower() for c in currencies]
+    pairs = [(a, b) for i, a in enumerate(currencies) for b in currencies[i + 1:]]
+    target = pool_id.lower().removeprefix("0x")
+    for hook in candidates:
+        for first, second in pairs:
+            c0, c1 = sorted([first, second])
+            for fee in _FEE_CANDIDATES:
+                for spacing in _TICK_CANDIDATES:
+                    encoded = w3.codec.encode(
+                        ["address", "address", "uint24", "int24", "address"],
+                        [Web3.to_checksum_address(c0), Web3.to_checksum_address(c1),
+                         fee, spacing, Web3.to_checksum_address(hook)])
+                    if Web3.keccak(encoded).hex().lower().removeprefix("0x") == target:
+                        return (Web3.to_checksum_address(c0),
+                                Web3.to_checksum_address(c1), fee, spacing,
+                                Web3.to_checksum_address(hook))
+    return None
+
+
 def pool_key_from_swaps(w3, chain, pool_id, windows=(2000, 10000, 50000)):
     """
     Rebuild a PoolKey from a recent swap, on a chain whose history cannot be read.
@@ -620,7 +709,7 @@ class V4Pool(Pool):
             return None
 
 
-def load_pool(chain, identifier, w3=None, from_block=0):
+def load_pool(chain, identifier, w3=None, from_block=0, pool_key=None):
     """
     Load a pool from a V2/V3 address or a V4 pool id, working out everything else.
 
@@ -655,7 +744,9 @@ def load_pool(chain, identifier, w3=None, from_block=0):
             raise ValueError(
                 f"{chain.name} icin StateView adresi tanimli degil - V4 pool okunamaz"
             )
-        currency0, currency1, fee, tick_spacing, hooks = fetch_v4_pool_key(
+        # A caller that already worked the key out - because the chain could not be
+        # asked - hands it in rather than having it looked up again.
+        currency0, currency1, fee, tick_spacing, hooks = pool_key or fetch_v4_pool_key(
             w3, chain, identifier, from_block
         )
         symbol0, decimals0 = fetch_token_info(w3, currency0, chain)

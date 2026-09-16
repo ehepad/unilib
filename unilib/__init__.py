@@ -16,6 +16,7 @@ version you are talking to.
 """
 from .chains import CHAINS, HYPEREVM, NATIVE_ADDRESS, ROBINHOOD, ChainConfig, get_chain
 from .pools import (
+    find_pool_key,
     Pool,
     V2Pool,
     V3Pool,
