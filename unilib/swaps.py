@@ -252,7 +252,10 @@ class Swapper:
 
         Returns the output amount in human units, or None if the call reverted.
         """
-        is_native_in = token_in.lower() in (NATIVE_ADDRESS, self.chain.wrapped_native.lower())
+        # On a chain that cannot wrap, the base is an ordinary ERC-20 and the router
+        # takes it by transferFrom - sending value as well would go to a stub.
+        is_native_in = (token_in.lower() in (NATIVE_ADDRESS, self.chain.wrapped_native.lower())
+                        and self.chain.wraps_native)
         decimals_in = pool.decimals0 if token_in.lower() == pool.token0.lower() else pool.decimals1
         decimals_out = pool.decimals1 if token_in.lower() == pool.token0.lower() else pool.decimals0
         amount_in_wei = _resolve_wei(amount_in, amount_in_wei, decimals_in)
@@ -376,9 +379,22 @@ class Swapper:
         # V4 prices in the native coin itself (currency zero-address), the other
         # versions in its wrapped form.
         token_in = pool.base if pool.pool_type == "v4" else self.chain.wrapped_native
+
+        # Where the coin cannot be wrapped, buying is not the special case it is
+        # everywhere else: the base is an ERC-20 like any other, so it needs an
+        # approval, it is counted in its own decimals rather than the native 18, and
+        # nothing travels as value. Selling has always worked this way; this makes
+        # buying match on the chains that require it.
+        pays_erc20 = pool.pool_type != "v4" and not self.chain.wraps_native
+        if pays_erc20:
+            approval = self.ensure_allowance(
+                token_in, int(amount_in * 10**pool.base_decimals), router.address)
+            if not approval:
+                return approval
+
         min_out_human, expected = self._min_out(pool, token_in, amount_in, slippage_pct, min_out)
 
-        amount_in_wei = int(amount_in * 10**18)
+        amount_in_wei = int(amount_in * 10**(pool.base_decimals if pays_erc20 else 18))
         min_out_wei = int(min_out_human * 10**pool.decimals)
         deadline = int(time.time()) + deadline_seconds
 
@@ -393,7 +409,8 @@ class Swapper:
                     self.address, amount_in_wei, min_out_wei, deadline,
                 )
                 swap_fn = router.functions.exactInputSingle(params)
-                tx = self._v3_tx(router, swap_fn, deadline, value=amount_in_wei)
+                tx = self._v3_tx(router, swap_fn, deadline,
+                                 value=0 if pays_erc20 else amount_in_wei)
             elif pool.pool_type == "v2":
                 path = [
                     Web3.to_checksum_address(self.chain.wrapped_native),
@@ -449,6 +466,12 @@ class Swapper:
         # after an approval has already been sent.
         router = self._router_for(pool)
         amount_in_wei = _resolve_wei(amount_in, amount_in_wei, pool.decimals)
+
+        # Nothing to unwrap where nothing was wrapped. On a chain whose coin already
+        # is the ERC-20, the router's unwrapWETH9 points at a stub and reverts, taking
+        # the whole swap with it - so the request is dropped rather than obeyed. The
+        # proceeds are the coin either way; only the extra call was ever the point.
+        unwrap = unwrap and self.chain.wraps_native
 
         if approve:
             if pool.pool_type == "v4":

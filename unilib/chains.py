@@ -62,6 +62,12 @@ class ChainConfig:
     # Multicall3 sits at the same address on every chain checked so far - Robinhood,
     # HyperEVM and Base all carry identical bytecode there - so this defaults rather
     # than being set per chain. Point it elsewhere, or to None, if a chain differs.
+    # Whether the native coin can be wrapped into an ERC-20 the pools hold. True
+    # everywhere the wrapped form is a real WETH-style contract you can deposit into.
+    # False on a chain where the coin already has an ERC-20 interface and there is
+    # nothing to wrap - there the router's own WETH9 is a placeholder, the native-in
+    # path through it cannot work, and a buy is an ordinary approve-and-swap.
+    wraps_native: bool = True
     multicall: str | None = "0xcA11bde05977b3631167028862bE2a173976CA11"
 
     # Uniswap V2 charges 0.3% (997/1000). Forks differ - PancakeSwap uses 0.25%.
@@ -253,6 +259,9 @@ ARC = ChainConfig(
     # both msg.value and the router, which those two views do not agree on.
     wrapped_native="0x3600000000000000000000000000000000000000",
     native_symbol="USDC",
+    # Nothing to wrap: the coin is already the ERC-20, and the router's WETH9 is a
+    # 53-byte stub where every call reverts. Buying here approves and swaps.
+    wraps_native=False,
     # 24,546 bytes - the same size as Robinhood's - carrying both execute selectors,
     # with the canonical Permit2 and the V3 factory below embedded in its bytecode.
     # That last part is what ties it to this deployment rather than some other one.
