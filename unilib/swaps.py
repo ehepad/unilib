@@ -42,12 +42,15 @@ class Unconfirmed(RuntimeError):
 
     Not a failure. The transaction may yet be mined, may already have been, or may
     have been dropped by the node that accepted it - and from here those look the
-    same. What matters is that the caller must not send it again: a retry picks a
-    fresh nonce, so if the first one lands too, the trade happens twice.
+    same. What matters is that the caller must not blindly send it again: if the
+    first one's nonce is still taken, a retry gets the next nonce and both can land.
+    resolve_unconfirmed() tells the cases apart, which is why the nonce travels with
+    this.
     """
 
-    def __init__(self, tx_hash, timeout):
+    def __init__(self, tx_hash, timeout, nonce=None):
         self.tx_hash = tx_hash
+        self.nonce = nonce
         super().__init__(
             f"broadcast but not confirmed within {timeout}s - tx {tx_hash}; "
             "check it before sending again")
@@ -69,6 +72,8 @@ class TxResult:
     # True when the transaction was broadcast and its outcome is unknown. A caller
     # that retries on failure must not retry on this - see Unconfirmed.
     pending: bool = False
+    # The nonce a pending transaction was sent with - what resolve_unconfirmed() needs.
+    nonce: int | None = None
 
     def __bool__(self):
         return self.success
@@ -934,7 +939,7 @@ class Swapper:
             # The hash is the only handle on what happened. Swallowing the timeout
             # into a generic failure is how it used to get lost, leaving no way to
             # check the transaction and every reason to send it again.
-            raise Unconfirmed(_hex0x(tx_hash), RECEIPT_TIMEOUT_SECONDS)
+            raise Unconfirmed(_hex0x(tx_hash), RECEIPT_TIMEOUT_SECONDS, tx.get("nonce"))
 
     def _outcome(self, receipt, expected=None):
         """
@@ -958,7 +963,7 @@ class Swapper:
         """A failure as a TxResult, keeping the hash when the outcome is unknown."""
         if isinstance(error, Unconfirmed):
             return TxResult(success=False, tx_hash=error.tx_hash, pending=True,
-                            error=f"{prefix}{error}")
+                            nonce=error.nonce, error=f"{prefix}{error}")
         return TxResult(success=False, error=f"{prefix}{error}")
 
 
@@ -982,3 +987,66 @@ def _hex0x(value):
     """A hash with its 0x, whatever form web3 hands it back in."""
     text = value.hex() if hasattr(value, "hex") else str(value)
     return text if text.startswith("0x") else "0x" + text
+
+
+
+def resolve_unconfirmed(w3, address, tx_hash, nonce, wait_seconds=20, poll_seconds=2):
+    """
+    Settle what became of a transaction that went out without a receipt.
+
+    Returns (verdict, receipt):
+
+      "mined"    the transaction is on-chain; the receipt says whether it succeeded.
+      "dropped"  it will not be mined. Its nonce is free again, and anything sent now
+                 takes that same nonce - so at most one of the two can ever land, and
+                 retrying cannot make the trade happen twice.
+      "replaced" the nonce was used, but not by this transaction. It did not happen.
+      "unknown"  still sitting somewhere with its nonce taken. A retry would take the
+                 next nonce and both could land. Do not resend.
+
+    The nonce is the whole argument. A double trade needs two transactions on two
+    different nonces, and the only way to get there is to resend while the first
+    still holds its own. So the question is not "did it confirm" - that already timed
+    out - but "is its nonce still taken".
+
+    "dropped" is only returned after the pending count has sat at this nonce on two
+    consecutive looks, since a load-balanced endpoint can answer from different
+    mempools one call to the next. It happens on Arc: a transaction whose floor
+    the price moved past is left out by the block builder rather than mined as a
+    revert, waits a minute, and is evicted - costing nothing.
+    """
+    if nonce is None:
+        return "unknown", None
+
+    def receipt_of(h):
+        try:
+            return w3.eth.get_transaction_receipt(h)
+        except Exception:
+            return None
+
+    deadline = time.time() + wait_seconds
+    free_seen = 0
+    while True:
+        receipt = receipt_of(tx_hash)
+        if receipt is not None:
+            return "mined", receipt
+
+        latest = w3.eth.get_transaction_count(address, "latest")
+        pending = w3.eth.get_transaction_count(address, "pending")
+
+        if latest > nonce:
+            # Something consumed the nonce. A receipt can lag the nonce by a moment,
+            # so look a few more times before concluding it was not this transaction.
+            for _ in range(3):
+                time.sleep(poll_seconds)
+                receipt = receipt_of(tx_hash)
+                if receipt is not None:
+                    return "mined", receipt
+            return "replaced", None
+
+        free_seen = free_seen + 1 if pending <= nonce else 0
+        if free_seen >= 2:
+            return "dropped", None
+        if time.time() >= deadline:
+            return "unknown", None
+        time.sleep(poll_seconds)
