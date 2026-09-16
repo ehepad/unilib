@@ -237,10 +237,56 @@ BASE = ChainConfig(
     },
 )
 
+ARC = ChainConfig(
+    name="Arc",
+    chain_id=5042,
+    rpc_url="https://rpc.mainnet.arc.io",
+    # Circle's chain settles in USDC, and the coin paying for gas is the same balance
+    # as the ERC-20 - not a wrapper over it. There is no deposit() or withdraw() on
+    # this address, and nothing to wrap: the native view carries 18 decimals for gas
+    # accounting while the ERC-20 view carries the 6 USDC actually has. Measured on a
+    # live pool, whose balance reads 643,883,880,397,000,000,000,000 natively and
+    # 643,883,880,397 through the token - the same money, a factor of 1e12 apart.
+    #
+    # That gap is why only tracking is wired up here so far. Reading a price goes
+    # through the pool's own decimals and is unaffected; a swap hands one number to
+    # both msg.value and the router, which those two views do not agree on.
+    wrapped_native="0x3600000000000000000000000000000000000000",
+    native_symbol="USDC",
+    # 24,546 bytes - the same size as Robinhood's - carrying both execute selectors,
+    # with the canonical Permit2 and the V3 factory below embedded in its bytecode.
+    # That last part is what ties it to this deployment rather than some other one.
+    universal_router="0x4fca4a51ab4f23a7447b3284fbd7d73289a89fb1",
+    # Deployed at the canonical address here, and referenced by the router above.
+    permit2="0x000000000022D473030F116dDEE9F6B43aC78BA3",
+    # Found by scanning live blocks for calls carrying a router's selectors, then
+    # confirmed the way the notes require: its factory() returns exactly the factory
+    # read off the pool above. Not taken from any deployment page - Uniswap has not
+    # published one for this chain.
+    #
+    # Its WETH9() points at a 53-byte stub where every call reverts. SwapRouter02
+    # needs a WETH9 address to deploy and there is nothing here to wrap, so a
+    # placeholder went in. The consequence is not cosmetic: the native-in path
+    # through this router cannot work, and a trade here is an ordinary ERC-20 one -
+    # approve the 6-decimal USDC, call exactInputSingle. Which also means the 1e12
+    # gap between the two views of the coin never comes up, because msg.value is
+    # never involved.
+    v3_router="0x53bf6b0684ec7ef91e1387da3d1a1769bc5a6f77",
+    # Still missing. Only multi-hop routes need it; a single pool is simulated
+    # through the router above.
+    v3_quoter=None,
+    v2_router=None,
+    # V4 may or may not be live here; nothing has been verified, so nothing is stated.
+    state_view=None,
+    position_manager=None,
+    v4_quoter=None,
+)
+
 CHAINS = {
     ROBINHOOD.chain_id: ROBINHOOD,
     HYPEREVM.chain_id: HYPEREVM,
     BASE.chain_id: BASE,
+    ARC.chain_id: ARC,
 }
 
 
