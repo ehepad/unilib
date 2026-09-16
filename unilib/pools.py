@@ -128,7 +128,10 @@ def pool_key_from_logs(w3, state_view_address, pool_id, from_block=0):
 # hash that has to match exactly, so a wrong pair is rejected rather than accepted.
 _FEE_CANDIDATES = (0, 100, 200, 400, 500, 800, 1000, 2500, 3000, 4000, 5000,
                    10000, 15000, 20000, 25000, 30000, 8388608)
-_TICK_CANDIDATES = (1, 2, 4, 5, 10, 20, 30, 50, 60, 100, 120, 200, 500, 1000, 60000)
+# Walked rather than listed. Tick spacing is a free integer and pools do use values
+# nobody would think to enumerate - one here is 25 - while a keccak costs nothing, so
+# the range is swept instead of guessed at.
+_TICK_CANDIDATES = tuple(range(1, 1001)) + (60000,)
 _V4_SWAP_TOPIC = "0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f"
 _TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
@@ -162,22 +165,43 @@ def _addresses_from_recent_swaps(w3, chain, pool_id, windows=(2000, 10000, 50000
     if not logs:
         return [], []
 
-    currencies, others = [], []
-    # Several transactions rather than one: a pool traded through a route shows
-    # different ends each time, and the currencies turn up in whichever of them
-    # happened to swap this pool on its own.
-    for log in logs[-6:]:
-        receipt = w3.eth.get_transaction_receipt(log["transactionHash"])
-        for entry in receipt["logs"]:
+    # Sampled across the window rather than taken from the end, and a transaction
+    # that swapped this pool ALONE is worth far more than one that routed through
+    # it: only there do the Transfer logs belong to this pool rather than to the
+    # ends of somebody's route. So single-swap transactions are read first and the
+    # search stops at the first one found.
+    step = max(1, len(logs) // 25)
+    sample = logs[::step][:25]
+    currencies, others, seen = [], [], set()
+    for log in sample:
+        tx_hash = log["transactionHash"]
+        if tx_hash in seen:
+            continue
+        seen.add(tx_hash)
+        receipt = w3.eth.get_transaction_receipt(tx_hash)
+        entries = receipt["logs"]
+        swaps = sum(1 for e in entries
+                    if e["topics"] and _topic0(e) == _V4_SWAP_TOPIC)
+        alone = swaps == 1
+        for entry in entries:
             address = entry["address"].lower()
-            topic = entry["topics"][0].hex().lower() if entry["topics"] else ""
-            topic = topic if topic.startswith("0x") else "0x" + topic
-            if topic == _TRANSFER_TOPIC:
+            if _topic0(entry) == _TRANSFER_TOPIC:
                 if address not in currencies:
                     currencies.append(address)
             elif address != manager.lower() and address not in others:
                 others.append(address)
+        if alone:
+            break
     return currencies, others
+
+
+def _topic0(entry):
+    if not entry["topics"]:
+        return ""
+    topic = entry["topics"][0]
+    topic = topic.hex() if hasattr(topic, "hex") else str(topic)
+    topic = topic.lower()
+    return topic if topic.startswith("0x") else "0x" + topic
 
 
 def find_pool_key(w3, chain, pool_id, currencies, hooks=()):
@@ -243,42 +267,15 @@ def pool_key_from_swaps(w3, chain, pool_id, windows=(2000, 10000, 50000)):
 
     Returns (currency0, currency1, fee, tick_spacing, hooks), or raises.
     """
-    state_view = w3.eth.contract(
-        address=Web3.to_checksum_address(chain.state_view), abi=abis.STATE_VIEW_ABI)
-    manager = state_view.functions.poolManager().call()
-
-    logs = []
-    latest = w3.eth.block_number
-    for window in windows:
-        try:
-            logs = w3.eth.get_logs({
-                "address": Web3.to_checksum_address(manager),
-                "topics": [_V4_SWAP_TOPIC, pool_id],
-                "fromBlock": max(0, latest - window),
-                "toBlock": "latest",
-            })
-        except Exception:
-            continue                    # range refused - try a narrower one
-        if logs:
-            break
-    if not logs:
+    currencies, others = _addresses_from_recent_swaps(w3, chain, pool_id, windows)
+    if not currencies:
         raise ValueError(
             f"{pool_id} icin yakin gecmiste swap yok - PoolKey kurulamiyor. "
             "Havuz islem gormeye baslayinca tekrar deneyin")
-
-    receipt = w3.eth.get_transaction_receipt(logs[-1]["transactionHash"])
-    currencies, hooks = [], [NATIVE_ADDRESS]
-    for log in receipt["logs"]:
-        address = log["address"].lower()
-        topic = log["topics"][0].hex().lower() if log["topics"] else ""
-        if not topic.startswith("0x"):
-            topic = "0x" + topic
-        if topic == _TRANSFER_TOPIC:
-            if address not in currencies:
-                currencies.append(address)
-        elif address not in hooks and address.lower() != manager.lower():
-            hooks.append(address)
-    currencies.append(NATIVE_ADDRESS)
+    # The native coin never shows as a Transfer - it is not a token - so it has to be
+    # offered as a candidate rather than discovered.
+    currencies = currencies + [NATIVE_ADDRESS]
+    hooks = [NATIVE_ADDRESS] + others
 
     pairs = [(a, b) for i, a in enumerate(currencies) for b in currencies[i + 1:]]
     target = pool_id.lower()
