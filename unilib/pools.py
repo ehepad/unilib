@@ -136,6 +136,104 @@ _V4_SWAP_TOPIC = "0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7
 _TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
 
+_INITIALIZE_TOPIC = "0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438"
+
+
+def pool_key_by_bisect(w3, chain, pool_id, window=4):
+    """
+    Find the block a pool was created in, then read its key out of that block.
+
+    The Initialize event carries the whole PoolKey and is the only thing that ever
+    did - nothing on-chain stores it afterwards. Reading it means knowing where to
+    look, and scanning for it is what every endpoint refuses: a free tier caps log
+    queries at ten or ten thousand blocks, against a chain millions deep.
+
+    Nothing has to be scanned. getSlot0 answers zero for a pool that does not exist
+    yet and something for one that does, so the creation block is a boundary and a
+    bisection walks to it in about as many calls as the chain has bits - two dozen
+    here. Then a single log query over a handful of blocks reads the event that any
+    endpoint will serve.
+
+    Needs an archive node, since the calls are historical. Where the node has pruned
+    them this raises and the caller falls through to guessing instead - but where it
+    has not, this is exact: the key comes from the event rather than from a search,
+    and is checked against the pool id before it is returned.
+    """
+    state_view = w3.eth.contract(
+        address=Web3.to_checksum_address(chain.state_view), abi=abis.STATE_VIEW_ABI)
+    manager = state_view.functions.poolManager().call()
+    raw_id = bytes.fromhex(pool_id.lower().removeprefix("0x"))
+
+    def state_at(block):
+        return state_view.functions.getSlot0(raw_id).call(block_identifier=block)[0] != 0
+
+    def initialised(block):
+        # A block before the contract existed answers with a revert rather than a
+        # zero, and that is a "not yet" like any other as far as the search cares.
+        try:
+            return state_at(block)
+        except Exception:
+            return False
+
+    latest = w3.eth.block_number
+    if not initialised(latest):
+        raise ValueError(f"{pool_id} bu zincirde kurulu degil")
+
+    # A pruning node refuses a call this far back, which the search would read as
+    # "not yet" all the way to the tip and then find no event there. Saying so is
+    # better than walking two dozen calls into a wrong answer.
+    try:
+        state_at(max(1, latest // 2))
+    except Exception as error:
+        raise ValueError("node gecmisi budamis - bisect kullanilamaz") from error
+
+    low, high = 0, latest
+    while low < high:
+        middle = (low + high) // 2
+        if initialised(middle):
+            high = middle
+        else:
+            low = middle + 1
+
+    # The bisection lands on the first block where the pool exists, which is the
+    # block it was created in - so one block is the whole query. Widening is a
+    # fallback for a chain that reorganised around the boundary, and stays small:
+    # an endpoint that caps log queries at ten blocks is exactly the kind this
+    # function exists for.
+    logs = []
+    for span in (0, window):
+        try:
+            logs = w3.eth.get_logs({
+                "address": Web3.to_checksum_address(manager),
+                "topics": [_INITIALIZE_TOPIC, pool_id],
+                "fromBlock": max(0, low - span),
+                "toBlock": low + span,
+            })
+        except Exception:
+            continue
+        if logs:
+            break
+    if not logs:
+        raise ValueError(f"{pool_id} icin Initialize event blok {low} civarinda bulunamadi")
+
+    entry = logs[0]
+    topics = [t.hex() if hasattr(t, "hex") else str(t) for t in entry["topics"]]
+    currency0 = Web3.to_checksum_address("0x" + topics[2].removeprefix("0x")[-40:])
+    currency1 = Web3.to_checksum_address("0x" + topics[3].removeprefix("0x")[-40:])
+    data = bytes(entry["data"])
+    fee = int.from_bytes(data[0:32], "big")
+    tick_spacing = int.from_bytes(data[32:64], "big", signed=True)
+    hooks = Web3.to_checksum_address("0x" + data[64:96].hex()[-40:])
+
+    # The event is trusted no further than the id it has to reproduce.
+    encoded = w3.codec.encode(
+        ["address", "address", "uint24", "int24", "address"],
+        [currency0, currency1, fee, tick_spacing, hooks])
+    if Web3.keccak(encoded).hex().lower().removeprefix("0x") != pool_id.lower().removeprefix("0x"):
+        raise ValueError(f"{pool_id} icin okunan PoolKey id ile tutmadi")
+    return currency0, currency1, fee, tick_spacing, hooks
+
+
 def _addresses_from_recent_swaps(w3, chain, pool_id, windows=(2000, 10000, 50000)):
     """
     Currencies and hook candidates from whatever swaps the node still remembers.
@@ -319,10 +417,18 @@ def fetch_v4_pool_key(w3, chain, pool_id, from_block=0):
     try:
         return pool_key_from_logs(w3, chain.state_view, pool_id, from_block)
     except Exception:
-        # Neither route was available. On a pruning endpoint that is not a dead end:
-        # the recent past still holds a swap, and a PoolKey can be rebuilt from it and
-        # checked against the id itself.
-        return pool_key_from_swaps(w3, chain, pool_id)
+        pass
+
+    # Scanning refused. On an archive node the event can still be reached without
+    # scanning at all, by bisecting to the block the pool was created in.
+    try:
+        return pool_key_by_bisect(w3, chain, pool_id)
+    except Exception:
+        pass
+
+    # No history to read. What is left is rebuilding the key from a recent swap and
+    # checking it against the id - a search, but one the id itself adjudicates.
+    return pool_key_from_swaps(w3, chain, pool_id)
 
 
 class Pool:
