@@ -285,10 +285,18 @@ ARC = ChainConfig(
     # through the router above.
     v3_quoter=None,
     v2_router=None,
-    # V4 may or may not be live here; nothing has been verified, so nothing is stated.
-    state_view=None,
+    # V4 is live. The PoolManager was read out of a Universal Router transaction's
+    # logs - it is the contract emitting the V4 Swap events - and turned out to sit at
+    # the same address it does on Robinhood, so these two were tried there too. Both
+    # answer poolManager() with that same address, which is what ties them to this
+    # chain's deployment rather than to a coincidence of bytecode.
+    state_view="0xF3334192D15450CdD385c8B70e03f9A6bD9E673b",
+    v4_quoter="0x8Dc178eFB8111BB0973Dd9d722ebeFF267c98F94",
+    # Not at the address the other chains use, and not found elsewhere yet. Its job
+    # here is poolKeys(), which recovers a V4 pool's key from its id; without it
+    # load_pool falls back to scanning Initialize events from block zero, and this
+    # endpoint caps the range.
     position_manager=None,
-    v4_quoter=None,
 )
 
 CHAINS = {
