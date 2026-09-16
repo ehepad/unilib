@@ -385,10 +385,20 @@ class Swapper:
         # approval, it is counted in its own decimals rather than the native 18, and
         # nothing travels as value. Selling has always worked this way; this makes
         # buying match on the chains that require it.
-        pays_erc20 = pool.pool_type != "v4" and not self.chain.wraps_native
+        #
+        # V4 included. A V4 pool can still price in the native coin itself even there,
+        # and then there is nothing to approve - so the test is what the pool actually
+        # holds, not which version it is. Who takes the token differs: V2 and V3
+        # routers pull it themselves, V4 goes through the Universal Router and so
+        # through Permit2.
+        pays_erc20 = not self.chain.wraps_native and token_in.lower() != NATIVE_ADDRESS
         if pays_erc20:
-            approval = self.ensure_allowance(
-                token_in, int(amount_in * 10**pool.base_decimals), router.address)
+            needed = int(amount_in * 10**pool.base_decimals)
+            approval = (
+                self.ensure_permit2_allowance(
+                    token_in, needed, self._require_universal_router())
+                if pool.pool_type == "v4"
+                else self.ensure_allowance(token_in, needed, router.address))
             if not approval:
                 return approval
 
@@ -400,8 +410,11 @@ class Swapper:
 
         try:
             if pool.pool_type == "v4":
+                # native_value=False where the base is an ERC-20: no wrap command,
+                # and settle_all pulls it from the wallet through Permit2 instead.
                 tx = self._v4_swap_tx(
-                    pool, token_in, amount_in_wei, min_out_wei, deadline, native_value=True
+                    pool, token_in, amount_in_wei, min_out_wei, deadline,
+                    native_value=not pays_erc20,
                 )
             elif pool.pool_type == "v3":
                 params = self._exact_input_params(
