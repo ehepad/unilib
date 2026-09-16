@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass
 
 from web3 import Web3
+from web3.exceptions import TimeExhausted
 
 from . import abis
 from .chains import NATIVE_ADDRESS
@@ -29,6 +30,27 @@ MAX_UINT160 = 2**160 - 1
 MAX_UINT48 = 2**48 - 1
 DEFAULT_DEADLINE_SECONDS = 120
 DEFAULT_SLIPPAGE_PCT = 0.5
+# How long to wait for a receipt before calling the outcome unknown. Blocks here come
+# every fraction of a second, so a transaction that has not landed in a minute has not
+# been delayed - it has been dropped, or the endpoint that took it never passed it on.
+RECEIPT_TIMEOUT_SECONDS = 60
+
+
+class Unconfirmed(RuntimeError):
+    """
+    A transaction went out and no receipt came back in time.
+
+    Not a failure. The transaction may yet be mined, may already have been, or may
+    have been dropped by the node that accepted it - and from here those look the
+    same. What matters is that the caller must not send it again: a retry picks a
+    fresh nonce, so if the first one lands too, the trade happens twice.
+    """
+
+    def __init__(self, tx_hash, timeout):
+        self.tx_hash = tx_hash
+        super().__init__(
+            f"broadcast but not confirmed within {timeout}s - tx {tx_hash}; "
+            "check it before sending again")
 
 
 @dataclass
@@ -44,6 +66,9 @@ class TxResult:
     tx_hash: str | None = None
     error: str | None = None
     amount_out: float | None = None
+    # True when the transaction was broadcast and its outcome is unknown. A caller
+    # that retries on failure must not retry on this - see Unconfirmed.
+    pending: bool = False
 
     def __bool__(self):
         return self.success
@@ -172,9 +197,9 @@ class Swapper:
                 "nonce": self.w3.eth.get_transaction_count(self.address),
             })
             receipt = self._sign_and_send(tx)
-            return TxResult(success=receipt.status == 1, tx_hash=receipt.transactionHash.hex())
+            return self._outcome(receipt)
         except Exception as e:
-            return TxResult(success=False, error=f"approve basarisiz: {e}")
+            return self._failure(e, "approve failed: ")
 
     def permit2_allowance(self, token_address, spender):
         """(amount, expiration, nonce) that Permit2 currently grants this spender."""
@@ -226,10 +251,9 @@ class Swapper:
                 MAX_UINT48,
             ).build_transaction(self._tx_params())
             receipt = self._sign_and_send(tx)
-            return TxResult(success=receipt.status == 1,
-                            tx_hash=receipt.transactionHash.hex())
+            return self._outcome(receipt)
         except Exception as e:
-            return TxResult(success=False, error=f"permit2 approve basarisiz: {e}")
+            return self._failure(e, "permit2 approve failed: ")
 
     # -- simulation ---------------------------------------------------------
 
@@ -448,17 +472,13 @@ class Swapper:
                 raise ValueError(f"bilinmeyen pool tipi: {pool.pool_type}")
 
             receipt = self._sign_and_send(tx)
-            return TxResult(
-                success=receipt.status == 1,
-                tx_hash=receipt.transactionHash.hex(),
-                amount_out=expected,
-            )
+            return self._outcome(receipt, expected)
         except (ValueError, ImportError):
             # Configuration problems (missing router, missing package) are permanent -
             # let them raise instead of coming back as a retryable failure.
             raise
         except Exception as e:
-            return TxResult(success=False, error=str(e))
+            return self._failure(e)
 
     # -- selling ------------------------------------------------------------
 
@@ -554,17 +574,13 @@ class Swapper:
                 raise ValueError(f"bilinmeyen pool tipi: {pool.pool_type}")
 
             receipt = self._sign_and_send(tx)
-            return TxResult(
-                success=receipt.status == 1,
-                tx_hash=receipt.transactionHash.hex(),
-                amount_out=expected,
-            )
+            return self._outcome(receipt, expected)
         except (ValueError, ImportError):
             # Configuration problems (missing router, missing package) are permanent -
             # let them raise instead of coming back as a retryable failure.
             raise
         except Exception as e:
-            return TxResult(success=False, error=str(e))
+            return self._failure(e)
 
     # -- routes -------------------------------------------------------------
 
@@ -738,11 +754,7 @@ class Swapper:
             if not route.is_v4_only:
                 tx = self._mixed_route_tx(route, amount_in_wei, min_out_wei, deadline)
                 receipt = self._sign_and_send(tx)
-                return TxResult(
-                    success=receipt.status == 1,
-                    tx_hash=receipt.transactionHash.hex(),
-                    amount_out=expected,
-                )
+                return self._outcome(receipt, expected)
 
             tx = (
                 codec.encode.chain()
@@ -765,17 +777,13 @@ class Swapper:
                 )
             )
             receipt = self._sign_and_send(tx)
-            return TxResult(
-                success=receipt.status == 1,
-                tx_hash=receipt.transactionHash.hex(),
-                amount_out=expected,
-            )
+            return self._outcome(receipt, expected)
         except (ValueError, ImportError):
             # Configuration problems are permanent - a missing router or a route with a
             # non-V4 hop will not start working on the next attempt.
             raise
         except Exception as e:
-            return TxResult(success=False, error=str(e))
+            return self._failure(e)
 
     # -- plumbing -----------------------------------------------------------
 
@@ -919,7 +927,39 @@ class Swapper:
         """
         signed = self.account.sign_transaction(tx)
         tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-        return self.w3.eth.wait_for_transaction_receipt(tx_hash)
+        try:
+            return self.w3.eth.wait_for_transaction_receipt(
+                tx_hash, timeout=RECEIPT_TIMEOUT_SECONDS)
+        except TimeExhausted:
+            # The hash is the only handle on what happened. Swallowing the timeout
+            # into a generic failure is how it used to get lost, leaving no way to
+            # check the transaction and every reason to send it again.
+            raise Unconfirmed(_hex0x(tx_hash), RECEIPT_TIMEOUT_SECONDS)
+
+    def _outcome(self, receipt, expected=None):
+        """
+        A mined transaction as a TxResult, with a reason when it reverted.
+
+        A revert used to come back with success=False and error=None, which the
+        scripts printed as "failed: None" - for the one kind of failure that actually
+        spent gas. It now says what happened and carries the hash to look it up.
+        """
+        tx_hash = _hex0x(receipt.transactionHash)
+        ok = receipt.status == 1
+        return TxResult(
+            success=ok,
+            tx_hash=tx_hash,
+            amount_out=expected,
+            error=None if ok else f"reverted on-chain - gas was spent - tx {tx_hash}",
+        )
+
+    @staticmethod
+    def _failure(error, prefix=""):
+        """A failure as a TxResult, keeping the hash when the outcome is unknown."""
+        if isinstance(error, Unconfirmed):
+            return TxResult(success=False, tx_hash=error.tx_hash, pending=True,
+                            error=f"{prefix}{error}")
+        return TxResult(success=False, error=f"{prefix}{error}")
 
 
 def _resolve_wei(amount_in, amount_in_wei, decimals):
@@ -937,3 +977,8 @@ def _resolve_wei(amount_in, amount_in_wei, decimals):
         raise ValueError("amount_in ya da amount_in_wei verilmeli")
     return int(amount_in * 10**decimals)
 
+
+def _hex0x(value):
+    """A hash with its 0x, whatever form web3 hands it back in."""
+    text = value.hex() if hasattr(value, "hex") else str(value)
+    return text if text.startswith("0x") else "0x" + text
