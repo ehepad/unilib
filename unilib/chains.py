@@ -281,10 +281,17 @@ ARC = ChainConfig(
     # gap between the two views of the coin never comes up, because msg.value is
     # never involved.
     v3_router="0x53bf6b0684ec7ef91e1387da3d1a1769bc5a6f77",
-    # Still missing. Only multi-hop routes need it; a single pool is simulated
-    # through the router above.
-    v3_quoter=None,
-    v2_router=None,
+    # From Uniswap's own deployment file for this chain, deployments/5042.md, and
+    # confirmed the way the notes require: factory() returns the V3 factory read off
+    # a live pool here. Worth having for its own sake - simulating a buy through the
+    # router needs the token in hand, because a trade here is an ordinary ERC-20 one,
+    # so a V3 pool on this chain had no honest quote at all without it.
+    v3_quoter="0x7dfd4f31be6814d2906bde155c3e1b146eac1468",
+    # V2 is deployed here after all. Its router answers factory() with the V2 factory
+    # from the same file. Its WETH() is the same 53-byte reverting stub the V3 router
+    # carries, so the native path is as dead as it is there - and as irrelevant, since
+    # the coin being swapped is already the ERC-20.
+    v2_router="0x1f7d7550b1b028f7571e69a784071f0205fd2efa",
     # V4 is live. The PoolManager was read out of a Universal Router transaction's
     # logs - it is the contract emitting the V4 Swap events - and turned out to sit at
     # the same address it does on Robinhood, so these two were tried there too. Both
@@ -292,11 +299,12 @@ ARC = ChainConfig(
     # chain's deployment rather than to a coincidence of bytecode.
     state_view="0xF3334192D15450CdD385c8B70e03f9A6bD9E673b",
     v4_quoter="0x8Dc178eFB8111BB0973Dd9d722ebeFF267c98F94",
-    # Not at the address the other chains use, and not found elsewhere yet. Its job
-    # here is poolKeys(), which recovers a V4 pool's key from its id; without it
-    # load_pool falls back to scanning Initialize events from block zero, and this
-    # endpoint caps the range.
-    position_manager=None,
+    # Its job here is poolKeys(), which recovers a V4 pool's key from its id. Without
+    # it load_pool fell back to scanning Initialize events from block zero, which this
+    # endpoint's range cap turns into a bisect over historical getSlot0 calls - the
+    # reason adding a V4 token here used to take several attempts. From the same
+    # deployment file, and confirmed by poolManager() returning this chain's manager.
+    position_manager="0x6049c9a0e26405c0985f9e3685c87d0ae917f82b",
 )
 
 CHAINS = {
