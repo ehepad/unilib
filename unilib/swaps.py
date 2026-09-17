@@ -302,11 +302,24 @@ class Swapper:
                     0,
                     int(time.time()) + DEFAULT_DEADLINE_SECONDS,
                 )
-                out_wei = self._call_with_balance(
-                    router.functions.exactInputSingle(params),
-                    value=amount_in_wei if is_native_in else 0,
-                )
-                return out_wei / 10**decimals_out
+                try:
+                    out_wei = self._call_with_balance(
+                        router.functions.exactInputSingle(params),
+                        value=amount_in_wei if is_native_in else 0,
+                    )
+                    return out_wei / 10**decimals_out
+                except Exception:
+                    # The router moves the token before it reaches the pool, so it
+                    # answers only to someone who holds it and has approved. That is
+                    # every trade on a chain that cannot wrap its coin - Arc pays in
+                    # USDC as an ordinary ERC-20 - and every sell anywhere without an
+                    # allowance in place. The quoter reads the pool and moves nothing,
+                    # so it answers either way; it is the fallback, not the first
+                    # choice, because the router is what the trade will actually run.
+                    quoted = self._v3_quote(pool, token_in, token_out, amount_in_wei)
+                    if quoted is None:
+                        raise
+                    return quoted / 10**decimals_out
 
             if pool.pool_type == "v2":
                 # V2's own getAmountsOut is a view function and already exact for
@@ -333,6 +346,26 @@ class Swapper:
             raise
         except Exception:
             return None
+
+    def _v3_quote(self, pool, token_in, token_out, amount_in_wei):
+        """QuoterV2's answer for one V3 pool, in the output token's own units."""
+        if not self.chain.v3_quoter:
+            return None
+        quoter = self.w3.eth.contract(
+            address=Web3.to_checksum_address(self.chain.v3_quoter),
+            abi=abis.V3_QUOTER_ABI,
+        )
+        try:
+            return quoter.functions.quoteExactInputSingle((
+                Web3.to_checksum_address(self._as_wrapped(token_in)),
+                Web3.to_checksum_address(self._as_wrapped(token_out)),
+                int(amount_in_wei),
+                pool.fee,
+                0,
+            )).call()[0]
+        except Exception:
+            return None
+
 
     def _call_with_balance(self, fn, value=0):
         """
