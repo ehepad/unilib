@@ -237,6 +237,10 @@ BASE = ChainConfig(
     permit2="0x000000000022D473030F116dDEE9F6B43aC78BA3",
     # SwapRouter02 - deadline is not in the params struct here.
     v3_router="0x2626664c2603336E57B271c5C0b26F421741e481",
+    # From Uniswap's SDK address table, confirmed here the way the notes require: its
+    # factory() returns this chain's V3 factory. Without it a V3 pool can only be
+    # simulated through the router, which needs the token in hand for a sell.
+    v3_quoter="0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a",
     v2_router="0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24",
     extra_base_tokens={
         "USDC": ("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", 6),
