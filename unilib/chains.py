@@ -79,6 +79,13 @@ class ChainConfig:
     # native. Used to work out which side of a pool is the token being tracked.
     # Format: {"USDC": ("0x...", 6)}
     extra_base_tokens: dict = field(default_factory=dict)
+    # Where signed transactions go, when that is not where everything else is read.
+    # Only Ethereum sets it: its mempool is public, and a swap seen there before it
+    # lands is sandwiched for up to its whole slippage. A private relay accepts the
+    # transaction but answers no eth_call, so reads stay on rpc_url and only the
+    # broadcast takes this road. None everywhere else - a sequencer has no mempool
+    # to be seen in.
+    send_rpc_url: str | None = None
 
     def __post_init__(self):
         # Address comparison bugs are silent and nasty, so normalise once here
@@ -131,6 +138,19 @@ class ChainConfig:
             CHAIN = CHAINS[999].with_rpc("https://...")
         """
         return replace(self, rpc_url=rpc_url)
+
+    def broadcast(self, w3, raw_transaction):
+        """
+        Send a signed transaction, through send_rpc_url where the chain has one.
+
+        Every broadcast in a project built on this should come through here rather
+        than through w3 directly, or one forgotten call becomes the transaction that
+        goes out in public.
+        """
+        if not self.send_rpc_url:
+            return w3.eth.send_raw_transaction(raw_transaction)
+        relay = Web3(Web3.HTTPProvider(self.send_rpc_url, request_kwargs={"timeout": 20}))
+        return relay.eth.send_raw_transaction(raw_transaction)
 
     def connect(self, verify=True):
         """
@@ -311,11 +331,48 @@ ARC = ChainConfig(
     position_manager="0x6049c9a0e26405c0985f9e3685c87d0ae917f82b",
 )
 
+
+ETHEREUM = ChainConfig(
+    name="Ethereum",
+    chain_id=1,
+    # A public endpoint for reading. Sending is a different matter here, unlike every
+    # other chain in this file: Ethereum has a public mempool, and a swap seen there
+    # before it lands is sandwiched for up to its whole slippage. Send through a
+    # private relay - settings.py's CUSTOM_RPC set to Flashbots Protect does it.
+    rpc_url="https://ethereum-rpc.publicnode.com",
+    wrapped_native="0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+    native_symbol="ETH",
+    # Every address below is from Uniswap's own deployment file, deployments/1.md, and
+    # was confirmed against the chain rather than trusted: the quoter and SwapRouter02
+    # answer factory() with the V3 factory, PositionManager, StateView and the V4
+    # quoter answer poolManager() with the PoolManager, and the Universal Router
+    # carries both the PoolManager and Permit2 in its bytecode.
+    v2_router="0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D",
+    v3_router="0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",
+    # QuoterV2, not the Quoter V1 the SDK's shared table still lists for this chain -
+    # the two take different arguments, and V1's would not decode here.
+    v3_quoter="0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
+    state_view="0x7ffe42c4a5deea5b0fec41c94c136cf115597227",
+    position_manager="0xbd216513d74c8cf14cf4747e6aaa6420ff64ee9e",
+    v4_quoter="0x52f0e24d1c21c8a0cb1e5a5dd6198556bd9e1203",
+    universal_router="0x23617e59A5925b2A4Bf75d73ff6711cD0b29De85",
+    permit2="0x000000000022D473030F116dDEE9F6B43aC78BA3",
+    # Flashbots Protect: sends privately to builders, never to the public mempool,
+    # and refunds a failed transaction's gas rather than mining it. It refuses
+    # eth_call with a 403, which is why it is a send address and not rpc_url.
+    send_rpc_url="https://rpc.flashbots.net/fast",
+    extra_base_tokens={
+        "USDC": ("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", 6),
+        "USDT": ("0xdAC17F958D2ee523a2206206994597C13D831ec7", 6),
+    },
+)
+
 CHAINS = {
     ROBINHOOD.chain_id: ROBINHOOD,
     HYPEREVM.chain_id: HYPEREVM,
     BASE.chain_id: BASE,
     ARC.chain_id: ARC,
+    ETHEREUM.chain_id: ETHEREUM,
 }
 
 

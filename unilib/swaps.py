@@ -964,7 +964,7 @@ class Swapper:
         it is broadcast and before any gas is spent on it.
         """
         signed = self.account.sign_transaction(tx)
-        tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+        tx_hash = self.chain.broadcast(self.w3, signed.raw_transaction)
         try:
             return self.w3.eth.wait_for_transaction_receipt(
                 tx_hash, timeout=RECEIPT_TIMEOUT_SECONDS)
